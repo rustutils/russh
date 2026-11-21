@@ -1827,4 +1827,100 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
         agent.kill().await.unwrap();
         agent.wait().await.unwrap();
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_query_extensions() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+
+        let extensions = client.query_extensions().await.unwrap();
+        assert!(
+            extensions.iter().any(|e| e == "session-bind@openssh.com"),
+            "{extensions:?}"
+        );
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_unsupported_extension_keeps_connection_usable() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+
+        // A well-formed request for an unknown extension is refused...
+        assert!(matches!(
+            client.extension(b"unknown@example.com", b"").await,
+            Err(Error::AgentFailure)
+        ));
+        // ...and the connection keeps working afterwards.
+        assert!(client.request_identities().await.unwrap().is_empty());
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_remove_certificate() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+        let ca_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let cert = create_test_cert(&ca_key, &key);
+
+        client.add_identity(&key, &[]).await.unwrap();
+        client
+            .add_identity_with_certificate(&key, &cert, &[])
+            .await
+            .unwrap();
+        assert_eq!(client.request_identities().await.unwrap().len(), 2);
+
+        client.remove_certificate(&cert).await.unwrap();
+        let identities = client.request_identities().await.unwrap();
+        assert_eq!(identities.len(), 1);
+        assert!(matches!(identities[0], AgentIdentity::PublicKey { .. }));
+
+        // Removing it again fails: the agent no longer has it.
+        assert!(client.remove_certificate(&cert).await.is_err());
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_remove_all_identities() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+
+        for key in keys_of_each_type() {
+            client.add_identity(&key, &[]).await.unwrap();
+        }
+        assert!(!client.request_identities().await.unwrap().is_empty());
+
+        client.remove_all_identities().await.unwrap();
+        assert!(client.request_identities().await.unwrap().is_empty());
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
 }

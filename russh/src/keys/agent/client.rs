@@ -579,6 +579,19 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         self.read_success().await
     }
 
+    /// Ask the agent to remove a certificate identity, as added by
+    /// [`Self::add_identity_with_certificate`]. The plain key, if added
+    /// separately, stays in the agent.
+    pub async fn remove_certificate(&mut self, certificate: &Certificate) -> Result<(), Error> {
+        self.buf.clear();
+        self.buf.resize(4, 0);
+        self.buf.push(msg::REMOVE_IDENTITY);
+        certificate.to_bytes()?.encode(&mut self.buf)?;
+        let len = self.buf.len() - 4;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
+        self.read_success().await
+    }
+
     /// Ask the agent to remove a smartcard from its memory.
     pub async fn remove_smartcard_key(&mut self, id: &str, pin: &[u8]) -> Result<(), Error> {
         self.buf.clear();
@@ -596,7 +609,8 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         self.buf.clear();
         self.buf.resize(4, 0);
         msg::REMOVE_ALL_IDENTITIES.encode(&mut self.buf)?;
-        1u32.encode(&mut self.buf)?;
+        let len = self.buf.len() - 4;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
         self.read_success().await
     }
 
@@ -608,7 +622,7 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         typ.encode(&mut self.buf)?;
         ext.encode(&mut self.buf)?;
         let len = self.buf.len() - 4;
-        (len as u32).encode(&mut self.buf)?;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
         self.read_response().await?;
         // draft-miller-ssh-agent 4.7: a supported extension may reply with
         // SUCCESS or EXTENSION_RESPONSE; anything else is a failure.
@@ -625,7 +639,7 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         msg::EXTENSION.encode(&mut self.buf)?;
         typ.encode(&mut self.buf)?;
         let len = self.buf.len() - 4;
-        (len as u32).encode(&mut self.buf)?;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
         self.read_response().await?;
 
         match self.buf.split_first() {
@@ -634,6 +648,33 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    /// Ask the agent which protocol extensions it supports, using the
+    /// `query` extension (draft-miller-ssh-agent, section 4.7.1). Agents
+    /// that don't support `query` are reported as [`Error::AgentFailure`].
+    pub async fn query_extensions(&mut self) -> Result<Vec<String>, Error> {
+        self.buf.clear();
+        self.buf.resize(4, 0);
+        msg::EXTENSION.encode(&mut self.buf)?;
+        "query".encode(&mut self.buf)?;
+        let len = self.buf.len() - 4;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
+        self.read_response().await?;
+
+        match self.buf.split_first() {
+            // The reply repeats the extension name, followed by one string
+            // per supported extension.
+            Some((&msg::EXTENSION_RESPONSE, mut r)) | Some((&msg::SUCCESS, mut r)) => {
+                let _query = String::decode(&mut r)?;
+                let mut extensions = Vec::new();
+                while !r.is_empty() {
+                    extensions.push(String::decode(&mut r)?);
+                }
+                Ok(extensions)
+            }
+            _ => Err(Error::AgentFailure),
         }
     }
 }

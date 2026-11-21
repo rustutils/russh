@@ -40,11 +40,13 @@ impl AgentSessionBinding {
 /// Write clients for SSH agents.
 pub mod client;
 mod msg;
+/// Typed agent protocol messages.
+pub mod proto;
 /// Write servers for SSH agents.
 pub mod server;
 
 /// Constraints on how keys can be used
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Constraint {
     /// The key shall disappear from the agent's memory after that many seconds.
     KeyLifetime { seconds: u32 },

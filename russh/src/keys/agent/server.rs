@@ -1,33 +1,55 @@
-use std::collections::HashMap;
 use std::marker::Sync;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use byteorder::{BigEndian, ByteOrder};
-use bytes::Bytes;
 use futures::future::Future;
 use futures::stream::{Stream, StreamExt};
-use ssh_encoding::{Decode, Encode, Reader};
 use ssh_key::{HashAlg, PrivateKey};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::sleep;
+use zeroize::Zeroizing;
 use {std, tokio};
 
+use super::proto::{self, AddIdentity, ExtensionRequest, Identity, Request, Response, SignRequest};
 use super::{Constraint, msg};
-use crate::CryptoVec;
-use crate::helpers::{EncodedExt, sign_with_hash_alg};
+use crate::helpers::sign_with_hash_alg;
 use crate::keys::Error;
 use crate::keys::key::PrivateKeyWithHashAlg;
 
-const MAX_AGENT_FRAME_LEN: usize = 256 * 1024;
+/// A key held by the agent.
+struct Entry {
+    /// Public key blob, or certificate blob for certificate identities.
+    blob: Vec<u8>,
+    key: Arc<PrivateKey>,
+    comment: String,
+    confirm: bool,
+    /// Distinguishes this addition from earlier ones of the same key, so a
+    /// lifetime timer only removes the addition it belongs to.
+    generation: u64,
+}
 
-#[derive(Clone)]
-#[allow(clippy::type_complexity)]
-struct KeyStore(Arc<RwLock<HashMap<Vec<u8>, (Arc<PrivateKey>, SystemTime, Vec<Constraint>)>>>);
+/// State shared by all connections to one agent.
+#[derive(Default)]
+struct State {
+    /// Keys in the order they were added; re-adding a key keeps its place.
+    entries: Vec<Entry>,
+    /// Lock passphrase while the agent is locked.
+    lock: Option<Zeroizing<Vec<u8>>>,
+    next_generation: u64,
+}
 
-#[derive(Clone)]
-struct Lock(Arc<RwLock<CryptoVec>>);
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<State>>);
+
+impl Shared {
+    fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        // A panic while holding the lock can't leave the state inconsistent
+        // in a way that matters more than refusing service, so recover.
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut state)
+    }
+}
 
 #[allow(missing_docs)]
 #[derive(Debug)]
@@ -59,19 +81,26 @@ pub trait Agent: Clone + Send + 'static {
     }
 }
 
+/// Serve the agent protocol on every connection from `listener`, with keys
+/// kept in memory and shared between connections.
+///
+/// Identities are listed in the order they were added, with their comments;
+/// keys may be added together with a certificate. The lifetime and confirm
+/// constraints are supported (confirmation is delegated to
+/// [`Agent::confirm`]); keys with other constraints are refused. While
+/// locked, the agent lists no identities and refuses everything but
+/// unlocking. The only extension supported is `query`.
 pub async fn serve<S, L, A>(mut listener: L, agent: A) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
     L: Stream<Item = tokio::io::Result<S>> + Unpin,
     A: Agent + Send + Sync + 'static,
 {
-    let keys = KeyStore(Arc::new(RwLock::new(HashMap::new())));
-    let lock = Lock(Arc::new(RwLock::new(CryptoVec::new())));
+    let shared = Shared::default();
     while let Some(Ok(stream)) = listener.next().await {
         russh_util::runtime::spawn(
             (Connection {
-                lock: lock.clone(),
-                keys: keys.clone(),
+                shared: shared.clone(),
                 agent: Some(agent.clone()),
                 s: stream,
                 buf: Vec::new(),
@@ -89,8 +118,7 @@ impl Agent for () {
 }
 
 struct Connection<S: AsyncRead + AsyncWrite + Send + 'static, A: Agent> {
-    lock: Lock,
-    keys: KeyStore,
+    shared: Shared,
     agent: Option<A>,
     s: S,
     buf: Vec<u8>,
@@ -100,15 +128,10 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
     Connection<S, A>
 {
     async fn read_frame(&mut self) -> Result<(), Error> {
-        self.buf.clear();
-        self.buf.resize(4, 0);
-        self.s.read_exact(&mut self.buf).await?;
-
-        let len = BigEndian::read_u32(&self.buf) as usize;
-        if len > MAX_AGENT_FRAME_LEN {
+        let len = self.s.read_u32().await? as usize;
+        if len > proto::MAX_MESSAGE_LEN {
             return Err(Error::AgentProtocolError);
         }
-
         self.buf.clear();
         self.buf.resize(len, 0);
         self.s.read_exact(&mut self.buf).await?;
@@ -116,285 +139,238 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
     }
 
     async fn run(mut self) -> Result<(), Error> {
-        let mut writebuf = Vec::new();
         loop {
             self.read_frame().await?;
-            // respond
-            writebuf.clear();
-            self.respond(&mut writebuf).await?;
-            self.s.write_all(&writebuf).await?;
+            let response = match Request::decode(&self.buf) {
+                Ok(request) => self.respond(request).await,
+                // Like OpenSSH, answer malformed messages with a failure
+                // rather than dropping the connection.
+                Err(_) => Response::Failure,
+            };
+            let message = proto::frame(&response.encode()?)?;
+            self.s.write_all(&message).await?;
             self.s.flush().await?
         }
     }
 
-    async fn respond(&mut self, writebuf: &mut Vec<u8>) -> Result<(), Error> {
-        let is_locked = {
-            if let Ok(password) = self.lock.0.read() {
-                !password.is_empty()
-            } else {
-                true
-            }
-        };
-        writebuf.extend_from_slice(&[0, 0, 0, 0]);
-        let agentref = self.agent.as_ref().ok_or(Error::AgentFailure)?;
+    fn is_locked(&self) -> bool {
+        self.shared.with(|state| state.lock.is_some())
+    }
 
-        match self.buf.split_first() {
-            Some((&11, _))
-                if !is_locked && agentref.confirm_request(MessageType::RequestKeys).await =>
+    async fn allowed(&self, message: MessageType) -> bool {
+        match &self.agent {
+            Some(agent) => agent.confirm_request(message).await,
+            None => false,
+        }
+    }
+
+    async fn respond(&mut self, request: Request) -> Response {
+        let locked = self.is_locked();
+        match request {
+            Request::RequestIdentities if self.allowed(MessageType::RequestKeys).await => {
+                if locked {
+                    // OpenSSH lists nothing rather than failing.
+                    return Response::Identities(Vec::new());
+                }
+                Response::Identities(self.shared.with(|state| {
+                    state
+                        .entries
+                        .iter()
+                        .map(|entry| Identity {
+                            key_blob: entry.blob.clone(),
+                            comment: entry.comment.clone(),
+                        })
+                        .collect()
+                }))
+            }
+            Request::Sign(sign) if !locked && self.allowed(MessageType::Sign).await => {
+                self.sign(sign).await
+            }
+            Request::AddIdentity(add) if !locked && self.allowed(MessageType::AddKeys).await => {
+                self.add(*add)
+            }
+            Request::RemoveIdentity { key_blob }
+                if !locked && self.allowed(MessageType::RemoveKeys).await =>
             {
-                // request identities
-                if let Ok(keys) = self.keys.0.read() {
-                    msg::IDENTITIES_ANSWER.encode(writebuf)?;
-                    (keys.len() as u32).encode(writebuf)?;
-                    for (k, _) in keys.iter() {
-                        k.encode(writebuf)?;
-                        "".encode(writebuf)?;
+                let removed = self.shared.with(|state| {
+                    let before = state.entries.len();
+                    state.entries.retain(|entry| entry.blob != key_blob);
+                    state.entries.len() < before
+                });
+                if removed {
+                    Response::Success
+                } else {
+                    Response::Failure
+                }
+            }
+            Request::RemoveAllIdentities
+                if !locked && self.allowed(MessageType::RemoveAllKeys).await =>
+            {
+                self.shared.with(|state| state.entries.clear());
+                Response::Success
+            }
+            Request::Lock { passphrase } if !locked && self.allowed(MessageType::Lock).await => {
+                self.shared.with(|state| state.lock = Some(passphrase));
+                Response::Success
+            }
+            Request::Unlock { passphrase } if locked && self.allowed(MessageType::Unlock).await => {
+                let unlocked = self.shared.with(|state| {
+                    let matches = state
+                        .lock
+                        .as_ref()
+                        .is_some_and(|lock| bool::from(lock.as_slice().ct_eq(&passphrase)));
+                    if matches {
+                        state.lock = None;
                     }
+                    matches
+                });
+                if unlocked {
+                    Response::Success
                 } else {
-                    msg::FAILURE.encode(writebuf)?
+                    Response::Failure
                 }
             }
-            Some((&13, mut r))
-                if !is_locked && agentref.confirm_request(MessageType::Sign).await =>
-            {
-                // sign request
-                let agent = self.agent.take().ok_or(Error::AgentFailure)?;
-                let (agent, signed) = self.try_sign(agent, &mut r, writebuf).await?;
-                self.agent = Some(agent);
-                if signed {
-                    return Ok(());
-                } else {
-                    writebuf.resize(4, 0);
-                    writebuf.push(msg::FAILURE)
-                }
+            Request::Extension(ExtensionRequest::Query) => {
+                Response::query_response(&["query"]).unwrap_or(Response::Failure)
             }
-            Some((&17, mut r))
-                if !is_locked && agentref.confirm_request(MessageType::AddKeys).await =>
-            {
-                // add identity
-                if let Ok(true) = self.add_key(&mut r, false, writebuf).await {
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            Some((&18, mut r))
-                if !is_locked && agentref.confirm_request(MessageType::RemoveKeys).await =>
-            {
-                // remove identity
-                if let Ok(true) = self.remove_identity(&mut r) {
-                    writebuf.push(msg::SUCCESS)
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            Some((&19, _))
-                if !is_locked && agentref.confirm_request(MessageType::RemoveAllKeys).await =>
-            {
-                // remove all identities
-                if let Ok(mut keys) = self.keys.0.write() {
-                    keys.clear();
-                    writebuf.push(msg::SUCCESS)
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            Some((&22, mut r))
-                if !is_locked && agentref.confirm_request(MessageType::Lock).await =>
-            {
-                // lock
-                if let Ok(()) = self.lock(&mut r) {
-                    writebuf.push(msg::SUCCESS)
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            Some((&23, mut r))
-                if is_locked && agentref.confirm_request(MessageType::Unlock).await =>
-            {
-                // unlock
-                if let Ok(true) = self.unlock(&mut r) {
-                    writebuf.push(msg::SUCCESS)
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            Some((&25, mut r))
-                if !is_locked && agentref.confirm_request(MessageType::AddKeys).await =>
-            {
-                // add identity constrained
-                if let Ok(true) = self.add_key(&mut r, true, writebuf).await {
-                } else {
-                    writebuf.push(msg::FAILURE)
-                }
-            }
-            _ => {
-                // Message not understood
-                writebuf.push(msg::FAILURE)
-            }
-        }
-        let len = writebuf.len() - 4;
-        BigEndian::write_u32(&mut writebuf[..], len as u32);
-        Ok(())
-    }
-
-    fn lock<R: Reader>(&self, r: &mut R) -> Result<(), Error> {
-        let password = Bytes::decode(r)?;
-        let mut lock = self.lock.0.write().or(Err(Error::AgentFailure))?;
-        lock.extend(&password);
-        Ok(())
-    }
-
-    fn unlock<R: Reader>(&self, r: &mut R) -> Result<bool, Error> {
-        let password = Bytes::decode(r)?;
-        let mut lock = self.lock.0.write().or(Err(Error::AgentFailure))?;
-        if bool::from(lock[..].ct_eq(&password)) {
-            lock.clear();
-            Ok(true)
-        } else {
-            Ok(false)
+            _ => Response::Failure,
         }
     }
 
-    fn remove_identity<R: Reader>(&self, r: &mut R) -> Result<bool, Error> {
-        if let Ok(mut keys) = self.keys.0.write() {
-            if keys.remove(&Bytes::decode(r)?.to_vec()).is_some() {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn add_key<R: Reader>(
-        &self,
-        r: &mut R,
-        constrained: bool,
-        writebuf: &mut Vec<u8>,
-    ) -> Result<bool, Error> {
-        let (blob, key_pair) = {
-            let private_key =
-                ssh_key::private::PrivateKey::new(ssh_key::private::KeypairData::decode(r)?, "")?;
-            let _comment = String::decode(r)?;
-
-            (private_key.public_key().key_data().encoded()?, private_key)
-        };
-
-        let mut c = Vec::new();
+    fn add(&self, add: AddIdentity) -> Response {
         let mut lifetime = None;
-        if constrained {
-            while let Ok(t) = u8::decode(r) {
-                if t == msg::CONSTRAIN_LIFETIME {
-                    if lifetime.is_some() {
-                        return Ok(false);
+        let mut confirm = false;
+        for constraint in &add.constraints {
+            match constraint {
+                Constraint::KeyLifetime { seconds } => {
+                    if lifetime.replace(*seconds).is_some() {
+                        return Response::Failure;
                     }
-                    let seconds = u32::decode(r)?;
-                    lifetime = Some(seconds);
-                    c.push(Constraint::KeyLifetime { seconds });
-                } else if t == msg::CONSTRAIN_CONFIRM {
-                    if !c.contains(&Constraint::Confirm) {
-                        c.push(Constraint::Confirm)
-                    }
-                } else {
-                    return Ok(false);
                 }
+                Constraint::Confirm => confirm = true,
+                // Constraints we can't enforce must not be silently ignored.
+                Constraint::Extensions { .. } => return Response::Failure,
             }
         }
-        let now = SystemTime::now();
-        self.keys
-            .0
-            .write()
-            .or(Err(Error::AgentFailure))?
-            .insert(blob.clone(), (Arc::new(key_pair), now, c));
+        let blob = match &add.certificate {
+            Some(certificate) => certificate.to_bytes(),
+            None => add.key.public_key().to_bytes(),
+        };
+        let Ok(blob) = blob else {
+            return Response::Failure;
+        };
+        let comment = add.key.comment().as_str_lossy().to_string();
+        let key = Arc::new(add.key);
+
+        let generation = self.shared.with(|state| {
+            state.next_generation += 1;
+            let generation = state.next_generation;
+            let entry = Entry {
+                blob: blob.clone(),
+                key,
+                comment,
+                confirm,
+                generation,
+            };
+            match state.entries.iter_mut().find(|e| e.blob == blob) {
+                Some(existing) => *existing = entry,
+                None => state.entries.push(entry),
+            }
+            generation
+        });
+
         if let Some(seconds) = lifetime {
-            let keys = self.keys.clone();
+            let shared = self.shared.clone();
             russh_util::runtime::spawn(async move {
-                sleep(Duration::from_secs(seconds as u64)).await;
-                if let Ok(mut keys) = keys.0.write() {
-                    let delete = if let Some(&(_, time, _)) = keys.get(&blob) {
-                        time == now
-                    } else {
-                        false
-                    };
-                    if delete {
-                        keys.remove(&blob);
-                    }
-                }
+                sleep(Duration::from_secs(u64::from(seconds))).await;
+                shared.with(|state| {
+                    state
+                        .entries
+                        .retain(|e| !(e.blob == blob && e.generation == generation))
+                });
             });
         }
-        writebuf.push(msg::SUCCESS);
-        Ok(true)
+        Response::Success
     }
 
-    async fn try_sign<R: Reader>(
-        &self,
-        agent: A,
-        r: &mut R,
-        writebuf: &mut Vec<u8>,
-    ) -> Result<(A, bool), Error> {
-        let mut needs_confirm = false;
-        let blob = Bytes::decode(r)?.to_vec();
-        let key = {
-            let k = self.keys.0.read().or(Err(Error::AgentFailure))?;
-            if let Some((key, _, constraints)) = k.get(&blob) {
-                if constraints.contains(&Constraint::Confirm) {
-                    needs_confirm = true;
-                }
-                key.clone()
-            } else {
-                return Ok((agent, false));
-            }
+    async fn sign(&mut self, sign: SignRequest) -> Response {
+        let found = self.shared.with(|state| {
+            state
+                .entries
+                .iter()
+                .find(|e| e.blob == sign.key_blob)
+                .map(|e| (e.key.clone(), e.confirm, e.generation))
+        });
+        let Some((key, confirm, generation)) = found else {
+            return Response::Failure;
         };
-        let agent = if needs_confirm {
-            let (agent, ok) = agent.confirm(key.clone()).await;
-            if !ok {
-                return Ok((agent, false));
-            }
-            // The agent may have been locked or the key removed while
-            // confirmation was pending.
-            let locked = self.lock.0.read().map(|p| !p.is_empty()).unwrap_or(true);
-            let present = self
-                .keys
-                .0
-                .read()
-                .map(|k| k.contains_key(&blob))
-                .unwrap_or(false);
-            if locked || !present {
-                return Ok((agent, false));
-            }
-            agent
-        } else {
-            agent
-        };
-        writebuf.push(msg::SIGN_RESPONSE);
-        let data = Bytes::decode(r)?;
-        let flags = u32::decode(r)?;
 
-        let hash_alg = if flags & msg::SSH_AGENT_RSA_SHA2_256 != 0 {
+        if confirm {
+            let Some(agent) = self.agent.take() else {
+                return Response::Failure;
+            };
+            let (agent, ok) = agent.confirm(key.clone()).await;
+            self.agent = Some(agent);
+            if !ok {
+                return Response::Failure;
+            }
+            // The agent may have been locked, or the key removed or
+            // replaced, while confirmation was pending.
+            let still_valid = self.shared.with(|state| {
+                state.lock.is_none()
+                    && state
+                        .entries
+                        .iter()
+                        .any(|e| e.blob == sign.key_blob && e.generation == generation)
+            });
+            if !still_valid {
+                return Response::Failure;
+            }
+        }
+
+        let hash_alg = if sign.flags & msg::SSH_AGENT_RSA_SHA2_256 != 0 {
             Some(HashAlg::Sha256)
-        } else if flags & msg::SSH_AGENT_RSA_SHA2_512 != 0 {
+        } else if sign.flags & msg::SSH_AGENT_RSA_SHA2_512 != 0 {
             Some(HashAlg::Sha512)
         } else {
             None
         };
-
-        sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key, hash_alg), &data)?.encode(writebuf)?;
-
-        let len = writebuf.len();
-        BigEndian::write_u32(writebuf, (len - 4) as u32);
-
-        Ok((agent, true))
+        match sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key, hash_alg), &sign.data) {
+            Ok(signature) => Response::Signature(signature),
+            Err(_) => Response::Failure,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use byteorder::{BigEndian, ByteOrder};
+    use std::sync::Arc;
+
     use tokio::io::AsyncWriteExt;
 
-    use super::{Connection, KeyStore, Lock, MAX_AGENT_FRAME_LEN};
+    use super::{Agent, Connection, Shared};
     use crate::keys::Error;
+    use crate::keys::agent::Constraint;
+    use crate::keys::agent::proto::{self, AddIdentity, Request, Response, SignRequest};
+    use crate::keys::{Algorithm, PrivateKey};
+
+    fn connection<A: Agent + Sync>(agent: A) -> Connection<tokio::io::DuplexStream, A> {
+        let (server, _client) = tokio::io::duplex(64);
+        Connection {
+            shared: Shared::default(),
+            agent: Some(agent),
+            s: server,
+            buf: Vec::new(),
+        }
+    }
+
+    fn add(key: &PrivateKey, constraints: Vec<Constraint>) -> Request {
+        Request::AddIdentity(Box::new(AddIdentity {
+            key: key.clone(),
+            certificate: None,
+            constraints,
+        }))
+    }
 
     #[test]
     fn oversized_agent_request_is_rejected_before_allocation() -> std::io::Result<()> {
@@ -405,21 +381,15 @@ mod tests {
         runtime.block_on(async {
             let (server, mut client) = tokio::io::duplex(64);
             let connection = Connection {
-                lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(
-                    crate::CryptoVec::new(),
-                ))),
-                keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
-                    std::collections::HashMap::new(),
-                ))),
+                shared: Shared::default(),
                 agent: Some(()),
                 s: server,
                 buf: Vec::new(),
             };
             let server = tokio::spawn(async move { connection.run().await });
 
-            let mut frame = [0u8; 4];
-            BigEndian::write_u32(&mut frame, (MAX_AGENT_FRAME_LEN + 1) as u32);
-            client.write_all(&frame).await?;
+            let len = u32::try_from(proto::MAX_MESSAGE_LEN + 1).unwrap_or(u32::MAX);
+            client.write_all(&len.to_be_bytes()).await?;
             drop(client);
 
             let err = server.await.expect("server task").unwrap_err();
@@ -431,49 +401,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_confirm_constraints_are_stored_once() {
-        use ssh_encoding::Encode;
-
-        let (server, _client) = tokio::io::duplex(64);
-        let connection = Connection {
-            lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(
-                crate::CryptoVec::new(),
-            ))),
-            keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            ))),
-            agent: Some(()),
-            s: server,
-            buf: Vec::new(),
-        };
-
-        let keypair = ssh_key::private::KeypairData::Ed25519(
-            ssh_key::private::Ed25519Keypair::from_seed(&[7u8; 32]),
+    async fn duplicate_confirm_constraints_are_accepted() {
+        let mut connection = connection(());
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let constraints = vec![Constraint::Confirm; 100];
+        assert_eq!(
+            connection.respond(add(&key, constraints)).await,
+            Response::Success
         );
-        let mut payload = Vec::new();
-        keypair.encode(&mut payload).unwrap();
-        String::new().encode(&mut payload).unwrap();
-        payload.resize(payload.len() + 10_000, super::msg::CONSTRAIN_CONFIRM);
+        assert!(connection.shared.with(|state| state.entries[0].confirm));
+    }
 
-        let mut writebuf = Vec::new();
-        let mut r = &payload[..];
-        assert!(connection.add_key(&mut r, true, &mut writebuf).await.unwrap());
-
-        let keys = connection.keys.0.read().unwrap();
-        let (_, _, constraints) = keys.values().next().unwrap();
-        assert_eq!(constraints, &[super::Constraint::Confirm]);
+    #[tokio::test]
+    async fn duplicate_lifetime_constraints_are_refused() {
+        let mut connection = connection(());
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let lifetime = Constraint::KeyLifetime { seconds: 60 };
+        assert_eq!(
+            connection
+                .respond(add(&key, vec![lifetime.clone(), lifetime]))
+                .await,
+            Response::Failure
+        );
     }
 
     #[tokio::test]
     async fn sign_is_rejected_when_locked_during_confirm() {
         use std::future::Future;
-        use std::sync::Arc;
 
-        use ssh_encoding::Encode;
         use tokio::sync::Notify;
-
-        use super::{Agent, Constraint};
-        use crate::keys::PrivateKey;
+        use zeroize::Zeroizing;
 
         #[derive(Clone)]
         struct Delayed(Arc<Notify>, Arc<Notify>);
@@ -492,48 +449,29 @@ mod tests {
 
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let lock = Lock(std::sync::Arc::new(std::sync::RwLock::new(
-            crate::CryptoVec::new(),
-        )));
-        let (server, _client) = tokio::io::duplex(64);
-        let connection = Connection {
-            lock: lock.clone(),
-            keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            ))),
-            agent: Some(Delayed(entered.clone(), release.clone())),
-            s: server,
-            buf: Vec::new(),
-        };
+        let mut connection = connection(Delayed(entered.clone(), release.clone()));
+        let shared = connection.shared.clone();
 
-        let key = PrivateKey::random(&mut rand::rng(), crate::keys::Algorithm::Ed25519)
-            .unwrap();
-        let blob = key.public_key().to_bytes().unwrap();
-        connection.keys.0.write().unwrap().insert(
-            blob.clone(),
-            (Arc::new(key), std::time::SystemTime::now(), vec![Constraint::Confirm]),
-        );
-
-        let mut payload = Vec::new();
-        blob.encode(&mut payload).unwrap();
-        b"data".encode(&mut payload).unwrap();
-        0u32.encode(&mut payload).unwrap();
-
-        let signer = async {
-            let mut writebuf = Vec::new();
-            let agent = connection.agent.clone().unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        assert_eq!(
             connection
-                .try_sign(agent, &mut &payload[..], &mut writebuf)
-                .await
-                .unwrap()
-                .1
-        };
+                .respond(add(&key, vec![Constraint::Confirm]))
+                .await,
+            Response::Success
+        );
+        let sign = Request::Sign(SignRequest {
+            key_blob: key.public_key().to_bytes().unwrap(),
+            data: b"data".to_vec(),
+            flags: 0,
+        });
+
+        let signer = connection.respond(sign);
         let locker = async {
             entered.notified().await;
-            lock.0.write().unwrap().extend(b"pw");
+            shared.with(|state| state.lock = Some(Zeroizing::new(b"pw".to_vec())));
             release.notify_one();
         };
-        let (signed, ()) = tokio::join!(signer, locker);
-        assert!(!signed);
+        let (response, ()) = tokio::join!(signer, locker);
+        assert_eq!(response, Response::Failure);
     }
 }

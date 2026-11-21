@@ -4,6 +4,7 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::Bytes;
 use log::{debug, error};
 use ssh_encoding::{Decode, Encode, Reader};
+use ssh_key::private::{EcdsaKeypair, KeypairData};
 use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey, Signature};
 use tokio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -177,7 +178,8 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
     }
 
     /// Send a key to the agent, with a (possibly empty) slice of
-    /// constraints to apply when using the key to sign.
+    /// constraints to apply when using the key to sign. The key's comment
+    /// is sent along and reported back by [`Self::request_identities`].
     pub async fn add_identity(
         &mut self,
         key: &PrivateKey,
@@ -194,27 +196,65 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         }
 
         key.key_data().encode(&mut self.buf)?;
-        "".encode(&mut self.buf)?; // comment field
+        key.comment().as_bytes().encode(&mut self.buf)?;
+        encode_constraints(&mut self.buf, constraints)?;
 
-        if !constraints.is_empty() {
-            for cons in constraints {
-                match *cons {
-                    Constraint::KeyLifetime { seconds } => {
-                        msg::CONSTRAIN_LIFETIME.encode(&mut self.buf)?;
-                        seconds.encode(&mut self.buf)?;
-                    }
-                    Constraint::Confirm => self.buf.push(msg::CONSTRAIN_CONFIRM),
-                    Constraint::Extensions {
-                        ref name,
-                        ref details,
-                    } => {
-                        msg::CONSTRAIN_EXTENSION.encode(&mut self.buf)?;
-                        name.encode(&mut self.buf)?;
-                        details.encode(&mut self.buf)?;
-                    }
-                }
+        let len = self.buf.len() - 4;
+        BigEndian::write_u32(&mut self.buf[..], len as u32);
+
+        self.read_success().await
+    }
+
+    /// Send a key together with a certificate for it to the agent. The
+    /// agent then offers the certificate as an identity and signs with the
+    /// key when the certificate is used. The key's comment is sent along.
+    ///
+    /// Supported for RSA, ECDSA and Ed25519 keys. The certificate must be
+    /// for `key`; agents reject mismatched pairs.
+    pub async fn add_identity_with_certificate(
+        &mut self,
+        key: &PrivateKey,
+        certificate: &Certificate,
+        constraints: &[Constraint],
+    ) -> Result<(), Error> {
+        self.buf.clear();
+        self.buf.resize(4, 0);
+        if constraints.is_empty() {
+            self.buf.push(msg::ADD_IDENTITY)
+        } else {
+            self.buf.push(msg::ADD_ID_CONSTRAINED)
+        }
+
+        // OpenSSH's private key serialization for certificates: the
+        // certificate type and blob, then only the private parts of the
+        // key (the public parts are in the certificate).
+        certificate
+            .algorithm()
+            .to_certificate_type()
+            .encode(&mut self.buf)?;
+        certificate.encoded()?.encode(&mut self.buf)?;
+        match key.key_data() {
+            KeypairData::Rsa(rsa) => rsa.private().encode(&mut self.buf)?,
+            KeypairData::Ecdsa(EcdsaKeypair::NistP256 { private, .. }) => {
+                private.encode(&mut self.buf)?
+            }
+            KeypairData::Ecdsa(EcdsaKeypair::NistP384 { private, .. }) => {
+                private.encode(&mut self.buf)?
+            }
+            KeypairData::Ecdsa(EcdsaKeypair::NistP521 { private, .. }) => {
+                private.encode(&mut self.buf)?
+            }
+            KeypairData::Ed25519(ed25519) => ed25519.encode(&mut self.buf)?,
+            _ => {
+                return Err(Error::UnsupportedKeyType {
+                    key_type_string: key.algorithm().to_string(),
+                    key_type_raw: key.algorithm().as_str().as_bytes().to_vec(),
+                });
             }
         }
+        key.comment().as_bytes().encode(&mut self.buf)?;
+        encode_constraints(&mut self.buf, constraints)?;
+
         let len = self.buf.len() - 4;
         BigEndian::write_u32(&mut self.buf[..], len as u32);
 
@@ -238,26 +278,8 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         }
         id.encode(&mut self.buf)?;
         pin.encode(&mut self.buf)?;
-        if !constraints.is_empty() {
-            (constraints.len() as u32).encode(&mut self.buf)?;
-            for cons in constraints {
-                match *cons {
-                    Constraint::KeyLifetime { seconds } => {
-                        msg::CONSTRAIN_LIFETIME.encode(&mut self.buf)?;
-                        seconds.encode(&mut self.buf)?;
-                    }
-                    Constraint::Confirm => self.buf.push(msg::CONSTRAIN_CONFIRM),
-                    Constraint::Extensions {
-                        ref name,
-                        ref details,
-                    } => {
-                        msg::CONSTRAIN_EXTENSION.encode(&mut self.buf)?;
-                        name.encode(&mut self.buf)?;
-                        details.encode(&mut self.buf)?;
-                    }
-                }
-            }
-        }
+        // As for identities, constraints follow directly, without a count.
+        encode_constraints(&mut self.buf, constraints)?;
         let len = self.buf.len() - 4;
         BigEndian::write_u32(&mut self.buf[..], len as u32);
         self.read_success().await
@@ -614,6 +636,26 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
             _ => Ok(false),
         }
     }
+}
+
+/// Append key constraints in the agent protocol's format: each one is a
+/// type byte followed by its data, with no count in front.
+fn encode_constraints(buf: &mut Vec<u8>, constraints: &[Constraint]) -> Result<(), Error> {
+    for constraint in constraints {
+        match constraint {
+            Constraint::KeyLifetime { seconds } => {
+                msg::CONSTRAIN_LIFETIME.encode(buf)?;
+                seconds.encode(buf)?;
+            }
+            Constraint::Confirm => msg::CONSTRAIN_CONFIRM.encode(buf)?,
+            Constraint::Extensions { name, details } => {
+                msg::CONSTRAIN_EXTENSION.encode(buf)?;
+                name.encode(buf)?;
+                details.encode(buf)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

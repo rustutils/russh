@@ -1656,4 +1656,175 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
         agent.kill().await.unwrap();
         agent.wait().await.unwrap();
     }
+
+    /// Keys of every type the agent protocol can carry with a certificate.
+    #[cfg(unix)]
+    fn keys_of_each_type() -> Vec<PrivateKey> {
+        use ssh_key::private::{EcdsaKeypair, KeypairData, RsaKeypair};
+
+        let mut rng = rand::rng();
+        let mut keys = vec![
+            PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).unwrap(),
+            PrivateKey::new(
+                KeypairData::Rsa(RsaKeypair::random(&mut rng, 2048).unwrap()),
+                "",
+            )
+            .unwrap(),
+        ];
+        for curve in [
+            ssh_key::EcdsaCurve::NistP256,
+            ssh_key::EcdsaCurve::NistP384,
+            ssh_key::EcdsaCurve::NistP521,
+        ] {
+            let keypair = EcdsaKeypair::random(&mut rng, curve).unwrap();
+            keys.push(PrivateKey::new(KeypairData::Ecdsa(keypair), "").unwrap());
+        }
+        for key in &mut keys {
+            let comment = format!("comment for {}", key.algorithm());
+            key.set_comment(comment);
+        }
+        keys
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_add_identity_sends_comment() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+
+        let keys = keys_of_each_type();
+        for key in &keys {
+            client.add_identity(key, &[]).await.unwrap();
+        }
+
+        let identities = client.request_identities().await.unwrap();
+        assert_eq!(identities.len(), keys.len());
+        for key in &keys {
+            let identity = identities
+                .iter()
+                .find(|i| i.public_key().key_data() == key.public_key().key_data())
+                .expect("added key is listed");
+            assert_eq!(identity.comment(), key.comment().as_str_lossy());
+        }
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_add_identity_with_certificate() {
+        use ::signature::Verifier;
+        use ssh_encoding::Decode;
+
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+        let ca_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+
+        for key in keys_of_each_type() {
+            let cert = create_test_cert(&ca_key, &key);
+            client
+                .add_identity_with_certificate(&key, &cert, &[])
+                .await
+                .unwrap_or_else(|e| panic!("adding {} certificate: {e:?}", key.algorithm()));
+
+            // The agent lists the certificate with the key's comment.
+            let identities = client.request_identities().await.unwrap();
+            let listed = identities
+                .iter()
+                .find_map(|identity| match identity {
+                    AgentIdentity::Certificate {
+                        certificate,
+                        comment,
+                    } if certificate.public_key() == key.public_key().key_data() => {
+                        Some(comment.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{} certificate not listed", key.algorithm()));
+            assert_eq!(listed, key.comment().as_str_lossy());
+
+            // Signing with the certificate uses the key.
+            let data = b"data to sign".to_vec();
+            let hash_alg = match key.algorithm() {
+                ssh_key::Algorithm::Rsa { .. } => Some(HashAlg::Sha512),
+                _ => None,
+            };
+            let signed = client
+                .sign_request(&AgentIdentity::from(cert.clone()), hash_alg, data.clone())
+                .await
+                .unwrap();
+            let mut encoded = &signed[data.len()..];
+            let blob = bytes::Bytes::decode(&mut encoded).unwrap();
+            let signature = ssh_key::Signature::decode(&mut &blob[..]).unwrap();
+            key.public_key()
+                .key_data()
+                .verify(&data, &signature)
+                .unwrap_or_else(|e| panic!("{} signature: {e}", key.algorithm()));
+        }
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_add_identity_with_certificate_constrained() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+        let ca_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let cert = create_test_cert(&ca_key, &key);
+
+        client
+            .add_identity_with_certificate(
+                &key,
+                &cert,
+                &[agent::Constraint::KeyLifetime { seconds: 60 }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.request_identities().await.unwrap().len(), 1);
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_add_identity_with_mismatched_certificate_fails() {
+        use crate::keys::agent::client::AgentClient;
+
+        env_logger::try_init().unwrap_or(());
+        let (mut agent, agent_path, _dir) = spawn_agent().await.unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = AgentClient::connect(stream);
+        let ca_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let other = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let cert = create_test_cert(&ca_key, &other);
+
+        assert!(
+            client
+                .add_identity_with_certificate(&key, &cert, &[])
+                .await
+                .is_err()
+        );
+        assert!(client.request_identities().await.unwrap().is_empty());
+
+        agent.kill().await.unwrap();
+        agent.wait().await.unwrap();
+    }
 }

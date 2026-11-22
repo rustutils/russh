@@ -69,10 +69,54 @@ impl PublicKeyOrCertificate {
         }
     }
 
+    /// Whether both are the same host key: the same key (whatever signature
+    /// hash an RSA key was negotiated with), or the same certificate.
+    pub(crate) fn same_host_key(&self, other: &PublicKeyOrCertificate) -> bool {
+        match (self, other) {
+            (
+                PublicKeyOrCertificate::PublicKey { key: a, .. },
+                PublicKeyOrCertificate::PublicKey { key: b, .. },
+            ) => a.key_data() == b.key_data(),
+            (PublicKeyOrCertificate::Certificate(a), PublicKeyOrCertificate::Certificate(b)) => {
+                matches!((a.to_bytes(), b.to_bytes()), (Ok(a), Ok(b)) if a == b)
+            }
+            _ => false,
+        }
+    }
+
     pub fn certificate(&self) -> Option<&Certificate> {
         match self {
             PublicKeyOrCertificate::PublicKey { .. } => None,
             PublicKeyOrCertificate::Certificate(cert) => Some(cert),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use ssh_key::{HashAlg, PrivateKey};
+
+    use super::*;
+
+    fn key() -> PublicKey {
+        PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .clone()
+    }
+
+    #[test]
+    fn same_host_key() {
+        let a = key();
+        let b = key();
+        let plain = |key: &PublicKey, hash_alg| PublicKeyOrCertificate::PublicKey {
+            key: key.clone(),
+            hash_alg,
+        };
+        assert!(plain(&a, None).same_host_key(&plain(&a, None)));
+        // The negotiated signature hash doesn't make it another key.
+        assert!(plain(&a, None).same_host_key(&plain(&a, Some(HashAlg::Sha512))));
+        assert!(!plain(&a, None).same_host_key(&plain(&b, None)));
     }
 }

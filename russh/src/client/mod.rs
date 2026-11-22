@@ -103,6 +103,9 @@ pub struct Session {
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
     ext_info_count: u8,
+    /// The host key (or certificate) accepted in the initial key exchange.
+    /// A later key exchange presenting the same one needs no new check.
+    initial_host_key: Option<PublicKeyOrCertificate>,
 }
 
 impl Drop for Session {
@@ -1335,6 +1338,7 @@ impl Session {
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
             ext_info_count: 0,
+            initial_host_key: None,
         }
     }
 
@@ -2033,8 +2037,23 @@ async fn reply<H: Handler>(
                     session.common.strict_kex =
                         session.common.strict_kex || newkeys.names.strict_kex();
 
+                    let presented: Option<PublicKeyOrCertificate> = server_host_certificate
+                        .map(Into::into)
+                        .or_else(|| server_host_key.map(Into::into));
                     if session.common.encrypted.is_some() {
-                        // This is a rekey
+                        // This is a rekey. The server must still prove it is
+                        // a host the client trusts: the key accepted at the
+                        // start, or one the handler accepts now. Otherwise a
+                        // server could switch to an unchecked key mid-session.
+                        if let Some(presented) = &presented {
+                            let same = session
+                                .initial_host_key
+                                .as_ref()
+                                .is_some_and(|initial| initial.same_host_key(presented));
+                            if !same && !handler.check_server_key(presented).await? {
+                                return Err(crate::Error::UnknownKey.into());
+                            }
+                        }
                         handler
                             .kex_done(newkeys.kex.shared_secret_bytes(), &newkeys.names, session)
                             .await?;
@@ -2063,15 +2082,11 @@ async fn reply<H: Handler>(
                         // something the client was ever told to trust — asking
                         // about it as well would invite an implementation to
                         // answer yes to the wrong question.
-                        if let Some(certificate) = server_host_certificate {
-                            if !handler.check_server_key(&certificate.into()).await? {
+                        if let Some(presented) = presented {
+                            if !handler.check_server_key(&presented).await? {
                                 return Err(crate::Error::UnknownKey.into());
                             }
-                        } else if let Some(server_host_key) = server_host_key {
-                            let check = handler.check_server_key(&server_host_key.into()).await?;
-                            if !check {
-                                return Err(crate::Error::UnknownKey.into());
-                            }
+                            session.initial_host_key = Some(presented);
                         }
 
                         handler
@@ -2803,6 +2818,11 @@ pub trait Handler: Sized + Send {
     /// The library verifies the key exchange signature before this call,
     /// but it's up to the implementation to decide whether the key or certificate
     /// is trusted.
+    ///
+    /// It is called for the initial key exchange, and again for a later one
+    /// (rekeying) if the server then presents a different key or
+    /// certificate than the one accepted initially; rejecting it ends the
+    /// connection.
     #[allow(unused_variables)]
     fn check_server_key(
         &mut self,

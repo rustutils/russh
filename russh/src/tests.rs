@@ -1719,6 +1719,79 @@ mod rekey_under_load {
         }
     }
 
+    /// Counts host key checks.
+    struct CountingClient(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl client::Handler for CountingClient {
+        type Error = crate::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            // Only the first check may succeed: a rekey with the same key
+            // must not ask again.
+            let previous = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(previous == 0)
+        }
+    }
+
+    /// A rekey presenting the host key accepted initially is not checked
+    /// again (and doesn't fail when the handler would now refuse).
+    #[tokio::test]
+    async fn rekey_with_the_same_host_key_is_not_checked_again() {
+        let mut config = server::Config {
+            inactivity_timeout: None,
+            limits: Limits::new(16 * 1024, 1 << 30, std::time::Duration::from_secs(3600)),
+            ..Default::default()
+        };
+        config
+            .keys
+            .push(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let config = Arc::new(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = server::run_stream(config, socket, Echo).await.unwrap().await;
+        });
+
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let session = client::connect(
+            Arc::new(client::Config::default()),
+            addr,
+            CountingClient(Arc::clone(&checks)),
+        )
+        .await
+        .unwrap();
+        let mut session = session;
+        assert!(
+            session
+                .authenticate_publickey("user", PrivateKeyWithHashAlg::new(Arc::new(key), None))
+                .await
+                .unwrap()
+                .success()
+        );
+        let mut channel = session.channel_open_session().await.unwrap();
+        // Enough echoed data for the server to rekey several times.
+        let payload = vec![7u8; 128 * 1024];
+        channel.data(&payload[..]).await.unwrap();
+        let mut echoed = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while echoed < payload.len() {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => echoed += data.len(),
+                    Some(_) => {}
+                    None => panic!("channel closed after {echoed} bytes"),
+                }
+            }
+        })
+        .await
+        .expect("echo did not complete");
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// Server-initiated rekeys while the client streams data: the client's
     /// in-flight traffic (legal until it has seen the server's KEXINIT) is
     /// handled across each rekey with nothing lost or misordered.

@@ -33,7 +33,7 @@ mod negotiation;
 mod ssh_read;
 mod sshbuffer;
 
-pub use negotiation::{Names, Preferred};
+pub use negotiation::{HostKeyAlgorithm, Names, Preferred};
 
 mod pty;
 

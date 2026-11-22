@@ -67,6 +67,27 @@ impl Names {
     }
 }
 
+/// A host key algorithm as a client advertises it: a plain key algorithm,
+/// or the OpenSSH certificate variant of it (`*-cert-v01@openssh.com`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyAlgorithm {
+    /// The key algorithm (for RSA, including the signature hash).
+    pub algorithm: Algorithm,
+    /// Whether this is the certificate variant.
+    pub certificate: bool,
+}
+
+impl HostKeyAlgorithm {
+    /// The name used in the key exchange.
+    pub fn name(&self) -> String {
+        if self.certificate {
+            self.algorithm.to_certificate_type().to_string()
+        } else {
+            self.algorithm.to_string()
+        }
+    }
+}
+
 /// Lists of preferred algorithms. This is normally hard-coded into implementations.
 #[derive(Debug, Clone)]
 pub struct Preferred {
@@ -91,6 +112,16 @@ pub struct Preferred {
     /// [`check_server_key`](crate::client::Handler::check_server_key))
     /// — so turning it on is the caller's decision, never a default.
     pub host_key_certificates: Cow<'static, [Algorithm]>,
+    /// Client only: the host key algorithms to advertise, in this exact
+    /// order, plain keys and certificates mixed.
+    ///
+    /// When empty (the default), the client advertises the certificate
+    /// variants of [`host_key_certificates`](Self::host_key_certificates)
+    /// followed by [`key`](Self::key). Set this to interleave them instead,
+    /// for example to prefer a plain key the client already knows over a
+    /// certificate, as OpenSSH does for hosts in its `known_hosts`. When
+    /// set, `key` and `host_key_certificates` are not used for host keys.
+    pub host_key_order: Cow<'static, [HostKeyAlgorithm]>,
     /// Preferred symmetric ciphers.
     pub cipher: Cow<'static, [cipher::Name]>,
     /// Preferred MAC algorithms.
@@ -146,6 +177,24 @@ pub(crate) fn server_certificate_names(
 }
 
 impl Preferred {
+    /// The host key algorithms a client advertises, in order.
+    pub(crate) fn client_host_key_algorithms(&self) -> Vec<HostKeyAlgorithm> {
+        if !self.host_key_order.is_empty() {
+            return self.host_key_order.to_vec();
+        }
+        self.host_key_certificates
+            .iter()
+            .map(|algorithm| HostKeyAlgorithm {
+                algorithm: algorithm.clone(),
+                certificate: true,
+            })
+            .chain(self.key.iter().map(|algorithm| HostKeyAlgorithm {
+                algorithm: algorithm.clone(),
+                certificate: false,
+            }))
+            .collect()
+    }
+
     pub(crate) fn possible_host_key_algos_for_keys(
         &self,
         available_host_keys: &[PrivateKey],
@@ -213,6 +262,7 @@ impl Preferred {
     pub const DEFAULT: Preferred = Preferred {
         kex: Cow::Borrowed(SAFE_KEX_ORDER),
         host_key_certificates: Cow::Borrowed(&[]),
+        host_key_order: Cow::Borrowed(&[]),
         key: Cow::Borrowed(&[
             Algorithm::Ed25519,
             Algorithm::Ecdsa {
@@ -240,6 +290,7 @@ impl Preferred {
     pub const COMPRESSED: Preferred = Preferred {
         kex: Cow::Borrowed(SAFE_KEX_ORDER),
         host_key_certificates: Cow::Borrowed(&[]),
+        host_key_order: Cow::Borrowed(&[]),
         key: Preferred::DEFAULT.key,
         cipher: Cow::Borrowed(CIPHER_ORDER),
         mac: Cow::Borrowed(SAFE_HMAC_ORDER),
@@ -334,52 +385,55 @@ pub(crate) trait Select {
             None => pref.key.iter().map(ToOwned::to_owned).collect::<Vec<_>>(),
         };
 
-        // Certificate algorithms come from `pref.host_key_certificates` on the
-        // client and from the certificates the server holds (with a matching
-        // host key) on the server. Selection runs over the same combined
-        // name-list the peer saw — certificates ahead of plain keys — so
+        // The client advertises plain and certificate algorithms in the order
+        // of `Preferred::client_host_key_algorithms`; the server advertises
+        // certificates it holds (with a matching host key) ahead of its plain
+        // keys. Selection runs over the same name-list the peer saw, so
         // `key_both_first` keeps its meaning for `first_kex_packet_follows`.
         // The algorithm kept for a certificate is the plain one it contains:
         // that is what signs the exchange, and it is what every later step
         // needs; that a certificate was negotiated is recorded separately in
         // [`Names`].
-        let certificate_names = if Self::is_server() {
-            match (available_certificates, available_host_keys) {
+        let (key_both_first, key_algorithm, host_key_is_certificate) = if !Self::is_server() {
+            let advertised = pref.client_host_key_algorithms();
+            let names = advertised.iter().map(HostKeyAlgorithm::name).collect::<Vec<_>>();
+            let (both_first, name) = Self::select(&names[..], &key_list, AlgorithmKind::Key)?;
+            let chosen = advertised
+                .into_iter()
+                .find(|a| a.name() == name)
+                .ok_or(Error::KexInit)?;
+            (both_first, chosen.algorithm, chosen.certificate)
+        } else {
+            let certificate_names = match (available_certificates, available_host_keys) {
                 (Some(certificates), Some(keys)) => {
                     server_certificate_names(pref, certificates, keys)
                 }
                 _ => Vec::new(),
-            }
-        } else {
-            pref.host_key_certificates
-                .iter()
-                .map(Algorithm::to_certificate_type)
-                .collect::<Vec<_>>()
-        };
-        let (key_both_first, key_algorithm, host_key_is_certificate) = if certificate_names
-            .is_empty()
-        {
-            let (both_first, algorithm) =
-                Self::select(&possible_host_key_algos[..], &key_list, AlgorithmKind::Key)?;
-            (both_first, algorithm, false)
-        } else {
-            let advertised = certificate_names
-                .iter()
-                .cloned()
-                .chain(possible_host_key_algos.iter().map(ToString::to_string))
-                .collect::<Vec<_>>();
-            let (both_first, name) = Self::select(&advertised[..], &key_list, AlgorithmKind::Key)?;
-            let is_certificate = certificate_names.contains(&name);
-            let algorithm = if is_certificate {
-                Algorithm::new_certificate_ext(&name).map_err(|_| Error::KexInit)?
-            } else {
-                possible_host_key_algos
-                    .iter()
-                    .find(|a| a.to_string() == name)
-                    .cloned()
-                    .ok_or(Error::KexInit)?
             };
-            (both_first, algorithm, is_certificate)
+            if certificate_names.is_empty() {
+                let (both_first, algorithm) =
+                    Self::select(&possible_host_key_algos[..], &key_list, AlgorithmKind::Key)?;
+                (both_first, algorithm, false)
+            } else {
+                let advertised = certificate_names
+                    .iter()
+                    .cloned()
+                    .chain(possible_host_key_algos.iter().map(ToString::to_string))
+                    .collect::<Vec<_>>();
+                let (both_first, name) =
+                    Self::select(&advertised[..], &key_list, AlgorithmKind::Key)?;
+                let is_certificate = certificate_names.contains(&name);
+                let algorithm = if is_certificate {
+                    Algorithm::new_certificate_ext(&name).map_err(|_| Error::KexInit)?
+                } else {
+                    possible_host_key_algos
+                        .iter()
+                        .find(|a| a.to_string() == name)
+                        .cloned()
+                        .ok_or(Error::KexInit)?
+                };
+                (both_first, algorithm, is_certificate)
+            }
         };
 
         // Cipher
@@ -574,10 +628,9 @@ pub(crate) fn write_kex(
         } else {
             NameList(
                 prefs
-                    .host_key_certificates
+                    .client_host_key_algorithms()
                     .iter()
-                    .map(Algorithm::to_certificate_type)
-                    .chain(prefs.key.iter().map(ToString::to_string))
+                    .map(HostKeyAlgorithm::name)
                     .collect(),
             )
             .encode(w)?;
@@ -774,6 +827,71 @@ mod tests {
             Algorithm::Rsa {
                 hash: Some(HashAlg::Sha512)
             }
+        );
+    }
+
+    fn ordered_prefs(order: &'static [HostKeyAlgorithm]) -> Preferred {
+        Preferred {
+            host_key_order: Cow::Borrowed(order),
+            ..Preferred::DEFAULT
+        }
+    }
+
+    const PLAIN_FIRST: &[HostKeyAlgorithm] = &[
+        HostKeyAlgorithm {
+            algorithm: Algorithm::Ed25519,
+            certificate: false,
+        },
+        HostKeyAlgorithm {
+            algorithm: Algorithm::Ed25519,
+            certificate: true,
+        },
+    ];
+
+    /// With `host_key_order`, a plain key can be preferred over a
+    /// certificate the server also offers.
+    #[test]
+    fn host_key_order_interleaves() {
+        let buf = build_kexinit_keys(KEX_FIRST, &[ED25519_CERT, "ssh-ed25519"], false);
+        let names = Client::read_kex(&buf, &ordered_prefs(PLAIN_FIRST), None, None, &KexCause::Initial)
+            .unwrap();
+        assert!(!names.host_key_is_certificate);
+        assert_eq!(names.key, Algorithm::Ed25519);
+
+        // The certificate is still chosen when it is all the server offers.
+        let buf = build_kexinit_keys(KEX_FIRST, &[ED25519_CERT], false);
+        let names = Client::read_kex(&buf, &ordered_prefs(PLAIN_FIRST), None, None, &KexCause::Initial)
+            .unwrap();
+        assert!(names.host_key_is_certificate);
+        assert_eq!(names.key, Algorithm::Ed25519);
+
+        // `key` and `host_key_certificates` don't count when an order is set.
+        let prefs = Preferred {
+            host_key_certificates: Cow::Borrowed(&[Algorithm::Ed25519]),
+            ..ordered_prefs(&PLAIN_FIRST[..1])
+        };
+        let buf = build_kexinit_keys(KEX_FIRST, &[ED25519_CERT, "ecdsa-sha2-nistp256"], false);
+        assert!(Client::read_kex(&buf, &prefs, None, None, &KexCause::Initial).is_err());
+    }
+
+    /// The advertised list follows `host_key_order` exactly.
+    #[test]
+    fn host_key_order_is_advertised() {
+        assert_eq!(
+            ordered_prefs(PLAIN_FIRST)
+                .client_host_key_algorithms()
+                .iter()
+                .map(HostKeyAlgorithm::name)
+                .collect::<Vec<_>>(),
+            ["ssh-ed25519", ED25519_CERT]
+        );
+        assert_eq!(
+            cert_prefs(&[Algorithm::Ed25519])
+                .client_host_key_algorithms()
+                .first()
+                .map(HostKeyAlgorithm::name)
+                .as_deref(),
+            Some(ED25519_CERT)
         );
     }
 

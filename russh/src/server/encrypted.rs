@@ -820,6 +820,7 @@ mod tests {
         let mut config = Config::default();
         config.preferred = Preferred {
             host_key_certificates: Cow::Borrowed(&[]),
+            host_key_order: Cow::Borrowed(&[]),
             kex: Cow::Owned(vec![KEX_NONE]),
             key: Cow::Owned(vec![ssh_key::Algorithm::Ed25519]),
             cipher: Cow::Owned(vec![cipher::NONE]),

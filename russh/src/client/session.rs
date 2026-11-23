@@ -480,9 +480,13 @@ impl Session {
     }
 
     /// Asks the server to prove it holds the private half of each host key it announced through `hostkeys-00@openssh.com` (`hostkeys-prove-00@openssh.com`).
+    /// Meant for [`Handler::openssh_ext_host_keys_announced`](crate::client::Handler::openssh_ext_host_keys_announced).
+    ///
+    /// The reply is what [`Handle::hostkeys_prove`](crate::client::Handle::hostkeys_prove)
+    /// returns: success only if every key was proven.
     ///
     /// DANGER: reply channel may not be awaited while the Session is borrowed, as it will deadlock.
-    pub(crate) fn request_hostkeys_prove(
+    pub fn request_hostkeys_prove(
         &mut self,
         reply_channel: oneshot::Sender<Result<(), crate::Error>>,
         keys: Vec<crate::keys::PublicKey>,

@@ -194,7 +194,9 @@ pub(crate) mod macros {
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 pub(crate) use macros::map_err;
 
-#[doc(hidden)]
+/// Sign `data` with `key`, using its hash algorithm for RSA keys, and
+/// return the signature in SSH encoding (algorithm name and blob), as a
+/// [`Signer`](crate::auth::Signer) appends it to the data it was given.
 pub fn sign_with_hash_alg(key: &PrivateKeyWithHashAlg, data: &[u8]) -> ssh_key::Result<Vec<u8>> {
     Ok(match key.key_data() {
         #[cfg(feature = "rsa")]

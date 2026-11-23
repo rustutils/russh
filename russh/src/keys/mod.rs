@@ -69,6 +69,7 @@ use crate::helpers::EncodedExt;
 
 pub mod key;
 pub use key::PrivateKeyWithHashAlg;
+pub use crate::helpers::sign_with_hash_alg;
 
 mod format;
 pub use format::*;

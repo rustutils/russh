@@ -812,6 +812,22 @@ impl<H: Handler> Handle<H> {
         Ok(())
     }
 
+    /// The signature algorithms the server announced in `server-sig-algs`
+    /// (RFC 8308), without waiting for them: `None` if the extension hasn't
+    /// arrived (yet). Servers send it right after the key exchange, so once
+    /// a reply to an authentication request has arrived, `None` means the
+    /// server doesn't send it. Algorithms russh doesn't know are left out.
+    pub async fn server_sig_algs(&self) -> Result<Option<Vec<Algorithm>>, Error> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Msg::GetServerSigAlgs {
+                reply_channel: sender,
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        receiver.await.map_err(|_| Error::Inconsistent)
+    }
+
     /// Returns the best RSA hash algorithm supported by the server,
     /// as indicated by the `server-sig-algs` extension.
     /// If the server does not support the extension,

@@ -120,6 +120,7 @@ enum Reply {
     AuthSuccess,
     AuthFailure {
         proceed_with_methods: MethodSet,
+        method_names: Vec<String>,
         partial_success: bool,
     },
     ChannelOpenFailure,
@@ -284,6 +285,9 @@ pub enum KeyboardInteractiveAuthResponse {
     Failure {
         /// The server suggests to proceed with these auth methods
         remaining_methods: MethodSet,
+        /// The server's list of methods as sent, including those
+        /// [`MethodSet`] doesn't know
+        method_names: Vec<String>,
         /// The server says that though auth method has been accepted,
         /// further authentication is required
         partial_success: bool,
@@ -428,10 +432,12 @@ impl<H: Handler> Handle<H> {
                 Some(Reply::AuthSuccess) => return Ok(KeyboardInteractiveAuthResponse::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
+                    method_names,
                     partial_success,
                 }) => {
                     return Ok(KeyboardInteractiveAuthResponse::Failure {
                         remaining_methods,
+                        method_names,
                         partial_success,
                     });
                 }
@@ -468,16 +474,19 @@ impl<H: Handler> Handle<H> {
                 Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
+                    method_names,
                     partial_success,
                 }) => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
+                        method_names,
                         partial_success,
                     });
                 }
                 None => {
                     return Ok(AuthResult::Failure {
                         remaining_methods: MethodSet::empty(),
+                        method_names: Vec::new(),
                         partial_success: false,
                     });
                 }
@@ -560,10 +569,12 @@ impl<H: Handler> Handle<H> {
                 Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
+                    method_names,
                     partial_success,
                 }) => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
+                        method_names,
                         partial_success,
                     });
                 }
@@ -583,6 +594,7 @@ impl<H: Handler> Handle<H> {
                 None => {
                     return Ok(AuthResult::Failure {
                         remaining_methods: MethodSet::empty(),
+                        method_names: Vec::new(),
                         partial_success: false,
                     });
                 }
@@ -621,10 +633,12 @@ impl<H: Handler> Handle<H> {
                 Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
+                    method_names,
                     partial_success,
                 }) => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
+                        method_names,
                         partial_success,
                     });
                 }
@@ -649,6 +663,7 @@ impl<H: Handler> Handle<H> {
                 None => {
                     return Ok(AuthResult::Failure {
                         remaining_methods: MethodSet::empty(),
+                        method_names: Vec::new(),
                         partial_success: false,
                     });
                 }
@@ -705,10 +720,12 @@ impl<H: Handler> Handle<H> {
                 Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
                 Some(Reply::AuthFailure {
                     proceed_with_methods: remaining_methods,
+                    method_names,
                     partial_success,
                 }) => {
                     return Ok(AuthResult::Failure {
                         remaining_methods,
+                        method_names,
                         partial_success,
                     });
                 }
@@ -732,6 +749,7 @@ impl<H: Handler> Handle<H> {
                 None => {
                     return Ok(AuthResult::Failure {
                         remaining_methods: MethodSet::empty(),
+                        method_names: Vec::new(),
                         partial_success: false,
                     });
                 }

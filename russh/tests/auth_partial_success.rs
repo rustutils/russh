@@ -126,6 +126,7 @@ async fn none() {
     let client::AuthResult::Failure {
         partial_success,
         remaining_methods,
+        ..
     } = session.authenticate_none("alice").await.unwrap()
     else {
         panic!("expected AuthResult::Failure");
@@ -139,6 +140,7 @@ async fn password() {
     let client::AuthResult::Failure {
         partial_success,
         remaining_methods,
+        ..
     } = session
         .authenticate_password("alice", "hunter2")
         .await
@@ -156,6 +158,7 @@ async fn publickey() {
     let client::AuthResult::Failure {
         partial_success,
         remaining_methods,
+        ..
     } = session
         .authenticate_publickey("alice", PrivateKeyWithHashAlg::new(Arc::new(key), None))
         .await
@@ -183,6 +186,7 @@ async fn keyboard_interactive() {
     let client::KeyboardInteractiveAuthResponse::Failure {
         partial_success,
         remaining_methods,
+        ..
     } = session
         .authenticate_keyboard_interactive_respond(vec!["123456".to_string()])
         .await
@@ -220,6 +224,7 @@ async fn plain_rejection_after_partial_success() {
             client::AuthResult::Failure {
                 partial_success: false,
                 ref remaining_methods,
+                ..
             } if !remaining_methods.is_empty()
         ),
         "stale partial_success leaked into a plain rejection: {second:?}"
@@ -262,6 +267,7 @@ async fn handlerless_rejection_after_partial_success() {
             client::AuthResult::Failure {
                 partial_success: false,
                 ref remaining_methods,
+                ..
             } if !remaining_methods.is_empty()
         ),
         "expired cert reported as partial success: {second:?}"

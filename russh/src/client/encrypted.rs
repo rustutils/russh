@@ -144,8 +144,8 @@ impl Session {
                         Some((&msg::USERAUTH_FAILURE, mut r)) => {
                             debug!("userauth_failure");
 
-                            let remaining_methods: MethodSet =
-                                (&map_err!(NameList::decode(&mut r))?).into();
+                            let names = map_err!(NameList::decode(&mut r))?;
+                            let remaining_methods: MethodSet = (&names).into();
                             let partial_success = map_err!(u8::decode(&mut r))? != 0;
                             map_err!(ensure_end(&r))?;
                             debug!(
@@ -153,19 +153,17 @@ impl Session {
                             );
                             auth_request.methods = remaining_methods.clone();
 
-                            let no_more_methods = auth_request.methods.is_empty();
+                            // Even with no method left that russh knows, the
+                            // session stays up: what to do next (another
+                            // method, or giving up) is the caller's decision.
                             self.common.auth_method = None;
                             self.sender
                                 .send(Reply::AuthFailure {
                                     proceed_with_methods: remaining_methods,
+                                    method_names: names.0,
                                     partial_success,
                                 })
                                 .map_err(|_| crate::Error::SendError)?;
-
-                            // If no other authentication method is allowed by the server, give up.
-                            if no_more_methods {
-                                return Err(crate::Error::NoAuthMethod.into());
-                            }
                         }
                         Some((&msg::USERAUTH_INFO_REQUEST_OR_USERAUTH_PK_OK, mut r)) => {
                             if let Some(auth::CurrentRequest::GssapiWithMic) = auth_request.current

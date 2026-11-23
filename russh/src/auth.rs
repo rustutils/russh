@@ -155,6 +155,9 @@ pub enum AuthResult {
     Failure {
         /// The server suggests to proceed with these auth methods
         remaining_methods: MethodSet,
+        /// The server's list of methods as sent, including those
+        /// [`MethodSet`] doesn't know
+        method_names: Vec<String>,
         /// The server says that though auth method has been accepted,
         /// further authentication is required
         partial_success: bool,

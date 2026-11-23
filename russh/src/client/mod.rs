@@ -56,7 +56,7 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot;
 
-pub use crate::auth::AuthResult;
+pub use crate::auth::{AuthResult, PasswordAuthResponse};
 use crate::cert::PublicKeyOrCertificate;
 use crate::channels::{
     Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
@@ -142,6 +142,10 @@ enum Reply {
         name: String,
         instructions: String,
         prompts: Vec<Prompt>,
+    },
+    AuthPasswordChangeRequest {
+        prompt: String,
+        language_tag: String,
     },
     AuthGssapiResponse {
         selected_mechanism: Vec<u8>,
@@ -370,7 +374,11 @@ impl<H: Handler> Handle<H> {
         self.wait_recv_reply().await
     }
 
-    /// Perform password-based SSH authentication.
+    /// Perform password-based SSH authentication. A server's request to
+    /// change the password ends it with
+    /// [`Error::PasswordChangeRequired`](crate::Error::PasswordChangeRequired);
+    /// [`authenticate_password_or_change`](Self::authenticate_password_or_change)
+    /// reports it instead.
     pub async fn authenticate_password<U: Into<String>, P: Into<String>>(
         &mut self,
         user: U,
@@ -387,6 +395,79 @@ impl<H: Handler> Handle<H> {
             .await
             .map_err(|_| crate::Error::SendError)?;
         self.wait_recv_reply().await
+    }
+
+    /// Like [`authenticate_password`](Self::authenticate_password), but the
+    /// server may answer that the password must be changed
+    /// ([`PasswordAuthResponse::ChangeRequest`]), to be answered with
+    /// [`authenticate_password_change`](Self::authenticate_password_change).
+    pub async fn authenticate_password_or_change<U: Into<String>, P: Into<String>>(
+        &mut self,
+        user: U,
+        password: P,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        self.sender
+            .send(Msg::Authenticate {
+                user: user.into(),
+                method: auth::Method::Password {
+                    password: password.into(),
+                },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        self.wait_recv_password_reply().await
+    }
+
+    /// Change the password, answering a
+    /// [`PasswordAuthResponse::ChangeRequest`]. The server may ask again
+    /// (when it refuses the new password, say).
+    pub async fn authenticate_password_change<U: Into<String>, O: Into<String>, N: Into<String>>(
+        &mut self,
+        user: U,
+        old_password: O,
+        new_password: N,
+    ) -> Result<PasswordAuthResponse, crate::Error> {
+        self.sender
+            .send(Msg::Authenticate {
+                user: user.into(),
+                method: auth::Method::PasswordChange {
+                    old_password: old_password.into(),
+                    new_password: new_password.into(),
+                },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        self.wait_recv_password_reply().await
+    }
+
+    async fn wait_recv_password_reply(&mut self) -> Result<PasswordAuthResponse, crate::Error> {
+        loop {
+            match self.receiver.recv().await {
+                Some(Reply::AuthSuccess) => return Ok(PasswordAuthResponse::Success),
+                Some(Reply::AuthFailure {
+                    proceed_with_methods: remaining_methods,
+                    method_names,
+                    partial_success,
+                }) => {
+                    return Ok(PasswordAuthResponse::Failure {
+                        remaining_methods,
+                        method_names,
+                        partial_success,
+                    });
+                }
+                Some(Reply::AuthPasswordChangeRequest {
+                    prompt,
+                    language_tag,
+                }) => {
+                    return Ok(PasswordAuthResponse::ChangeRequest {
+                        prompt,
+                        language_tag,
+                    });
+                }
+                None => return Err(crate::Error::Disconnect),
+                _ => {}
+            }
+        }
     }
 
     /// Initiate Keyboard-Interactive based SSH authentication.
@@ -487,6 +568,9 @@ impl<H: Handler> Handle<H> {
                         method_names,
                         partial_success,
                     });
+                }
+                Some(Reply::AuthPasswordChangeRequest { .. }) => {
+                    return Err(crate::Error::PasswordChangeRequired);
                 }
                 None => {
                     return Ok(AuthResult::Failure {

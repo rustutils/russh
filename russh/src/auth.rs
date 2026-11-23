@@ -170,6 +170,31 @@ impl AuthResult {
     }
 }
 
+/// The server's answer to a password request, including a request to
+/// change the password (`SSH_MSG_USERAUTH_PASSWD_CHANGEREQ`, RFC 4252 §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordAuthResponse {
+    Success,
+    Failure {
+        /// The server suggests to proceed with these auth methods
+        remaining_methods: MethodSet,
+        /// The server's list of methods as sent, including those
+        /// [`MethodSet`] doesn't know
+        method_names: Vec<String>,
+        /// The server says that though auth method has been accepted,
+        /// further authentication is required
+        partial_success: bool,
+    },
+    /// The password has expired: answer with
+    /// [`Handle::authenticate_password_change`](crate::client::Handle::authenticate_password_change),
+    /// or try another method.
+    ChangeRequest {
+        /// The server's message to show the user.
+        prompt: String,
+        language_tag: String,
+    },
+}
+
 pub trait Signer: Sized {
     type Error: From<crate::SendError>;
 
@@ -281,6 +306,12 @@ pub enum Method {
     Password {
         password: String,
     },
+    /// A password request that changes the password, answering the
+    /// server's `SSH_MSG_USERAUTH_PASSWD_CHANGEREQ` (RFC 4252 §8).
+    PasswordChange {
+        old_password: String,
+        new_password: String,
+    },
     PublicKey {
         key: PrivateKeyWithHashAlg,
     },
@@ -309,8 +340,16 @@ pub enum Method {
 
 impl Drop for Method {
     fn drop(&mut self) {
-        if let Method::Password { password } = self {
-            password.zeroize();
+        match self {
+            Method::Password { password } => password.zeroize(),
+            Method::PasswordChange {
+                old_password,
+                new_password,
+            } => {
+                old_password.zeroize();
+                new_password.zeroize();
+            }
+            _ => {}
         }
     }
 }
@@ -322,6 +361,11 @@ impl std::fmt::Debug for Method {
             Method::Password { .. } => f
                 .debug_struct("Password")
                 .field("password", &"<redacted>")
+                .finish(),
+            Method::PasswordChange { .. } => f
+                .debug_struct("PasswordChange")
+                .field("old_password", &"<redacted>")
+                .field("new_password", &"<redacted>")
                 .finish(),
             Method::PublicKey { key } => f.debug_struct("PublicKey").field("key", key).finish(),
             Method::OpenSshCertificate { key, cert } => f
@@ -387,6 +431,9 @@ pub enum CurrentRequest {
         submethods: String,
     },
     GssapiWithMic,
+    /// A password request, which the server may answer with
+    /// `SSH_MSG_USERAUTH_PASSWD_CHANGEREQ`.
+    Password,
 }
 
 impl AuthRequest {
@@ -409,6 +456,9 @@ impl AuthRequest {
                 })
             }
             Method::GssapiWithMic { .. } => Some(CurrentRequest::GssapiWithMic),
+            Method::Password { .. } | Method::PasswordChange { .. } => {
+                Some(CurrentRequest::Password)
+            }
             _ => None,
         };
         Self {

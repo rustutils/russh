@@ -196,6 +196,12 @@ pub enum Error {
     #[error("The request was rejected by the other party")]
     RequestDenied,
 
+    /// The server asked to change the password, which
+    /// [`client::Handle::authenticate_password`] can't answer; see
+    /// [`client::Handle::authenticate_password_or_change`].
+    #[error("The server requires a new password")]
+    PasswordChangeRequired,
+
     #[error(transparent)]
     Keys(#[from] crate::keys::Error),
 

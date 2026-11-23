@@ -182,6 +182,19 @@ impl Session {
                                     })
                                     .map_err(|_| crate::Error::SendError)?;
                                 return Ok(());
+                            } else if let Some(auth::CurrentRequest::Password) = auth_request.current
+                            {
+                                debug!("userauth_passwd_changereq");
+                                let prompt = map_err!(String::decode(&mut r))?;
+                                let language_tag = map_err!(String::decode(&mut r))?;
+                                map_err!(ensure_end(&r))?;
+                                self.sender
+                                    .send(Reply::AuthPasswordChangeRequest {
+                                        prompt,
+                                        language_tag,
+                                    })
+                                    .map_err(|_| crate::Error::SendError)?;
+                                return Ok(());
                             } else if let Some(auth::CurrentRequest::PublicKey {
                                 ref mut sent_pk_ok,
                                 ..
@@ -1461,6 +1474,18 @@ impl Encrypted {
                     "password".encode(&mut self.write)?;
                     0u8.encode(&mut self.write)?;
                     password.encode(&mut self.write)?;
+                    true
+                }
+                auth::Method::PasswordChange {
+                    ref old_password,
+                    ref new_password,
+                } => {
+                    user.encode(&mut self.write)?;
+                    "ssh-connection".encode(&mut self.write)?;
+                    "password".encode(&mut self.write)?;
+                    1u8.encode(&mut self.write)?;
+                    old_password.encode(&mut self.write)?;
+                    new_password.encode(&mut self.write)?;
                     true
                 }
                 auth::Method::PublicKey { ref key } => {

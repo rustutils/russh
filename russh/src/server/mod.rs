@@ -196,6 +196,15 @@ pub enum Auth {
         /// typed by the user.
         prompts: Cow<'static, [(Cow<'static, str>, bool)]>,
     },
+
+    /// Ask the client to change the password
+    /// (`SSH_MSG_USERAUTH_PASSWD_CHANGEREQ`, RFC 4252 §8). Only for
+    /// [`Handler::auth_password`] and [`Handler::auth_password_change`];
+    /// elsewhere it is a rejection.
+    PasswordChangeRequired {
+        /// Shown to the user.
+        prompt: Cow<'static, str>,
+    },
 }
 
 impl Auth {
@@ -266,6 +275,19 @@ pub trait Handler: Sized {
         &mut self,
         user: &str,
         password: &str,
+    ) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
+        async { Ok(Auth::reject()) }
+    }
+
+    /// Check credentials using a password change request: the client
+    /// answers [`Auth::PasswordChangeRequired`] with its old and new
+    /// passwords (RFC 4252 §8). Rejected by default.
+    #[allow(unused_variables)]
+    fn auth_password_change(
+        &mut self,
+        user: &str,
+        old_password: &str,
+        new_password: &str,
     ) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
         async { Ok(Auth::reject()) }
     }

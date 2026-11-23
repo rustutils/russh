@@ -954,18 +954,31 @@ impl Encrypted {
                 auth_user.push_str(&user);
                 let change = map_err!(u8::decode(r))? != 0;
                 let password = map_err!(String::decode(r))?;
-                if change {
-                    let _new_password = map_err!(String::decode(r))?;
-                }
-                map_err!(ensure_end(r))?;
-                let auth = if change {
-                    Auth::Reject {
-                        proceed_with_methods: None,
-                        partial_success: false,
-                    }
+                let new_password = if change {
+                    Some(map_err!(String::decode(r))?)
                 } else {
-                    handler.auth_password(&user, &password).await?
+                    None
                 };
+                map_err!(ensure_end(r))?;
+                let auth = match new_password {
+                    Some(new_password) => {
+                        handler
+                            .auth_password_change(&user, &password, &new_password)
+                            .await?
+                    }
+                    None => handler.auth_password(&user, &password).await?,
+                };
+                if let Auth::PasswordChangeRequired { prompt } = auth {
+                    // The password method stays the current one: the
+                    // client answers with a change request.
+                    push_packet!(self.write, {
+                        map_err!(msg::USERAUTH_PASSWD_CHANGEREQ.encode(&mut self.write))?;
+                        map_err!(prompt.as_ref().encode(&mut self.write))?;
+                        map_err!("".encode(&mut self.write))?; // language tag
+                    });
+                    tokio::time::sleep_until(until).await;
+                    return Ok(());
+                }
                 if let Auth::Accept = auth {
                     server_auth_request_success(&mut self.write);
                     self.state = EncryptedState::InitCompression;
@@ -1430,6 +1443,11 @@ async fn reply_userauth_info_response(
             Ok(false)
         }
         Auth::UnsupportedMethod => Err(Error::UnsupportedAuthMethod),
+        // Only meaningful for password requests.
+        Auth::PasswordChangeRequired { .. } => {
+            reject_auth_request(until, write, auth_request).await?;
+            Ok(false)
+        }
     }
 }
 

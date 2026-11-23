@@ -106,6 +106,11 @@ pub struct Session {
     /// The host key (or certificate) accepted in the initial key exchange.
     /// A later key exchange presenting the same one needs no new check.
     initial_host_key: Option<PublicKeyOrCertificate>,
+    /// The blob of that host key, as the server sent it.
+    initial_host_key_blob: Option<Vec<u8>>,
+    /// The host key blob to bind public key signatures to, once the server
+    /// offered `publickey-hostbound@openssh.com` and the config allows it.
+    host_bound_key: Option<Vec<u8>>,
 }
 
 impl Drop for Session {
@@ -1373,6 +1378,8 @@ impl Session {
             server_sig_algs: None,
             ext_info_count: 0,
             initial_host_key: None,
+            initial_host_key_blob: None,
+            host_bound_key: None,
         }
     }
 
@@ -2122,6 +2129,9 @@ async fn reply<H: Handler>(
                             }
                             session.initial_host_key = Some(presented);
                         }
+                        session.initial_host_key_blob = agent_session_binding
+                            .as_ref()
+                            .map(|binding| binding.host_key().to_vec());
 
                         handler
                             .kex_done(newkeys.kex.shared_secret_bytes(), &newkeys.names, session)
@@ -2351,6 +2361,49 @@ mod tests {
             session.common.encrypted.as_ref().unwrap().received_extensions.len(),
             2
         );
+    }
+
+    fn ext_info_packet(name: &str, value: &[u8]) -> Vec<u8> {
+        let mut packet = vec![msg::EXT_INFO];
+        1u32.encode(&mut packet).unwrap();
+        name.encode(&mut packet).unwrap();
+        value.encode(&mut packet).unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn host_bound_follows_the_initial_ext_info() {
+        const HOSTBOUND: &str = "publickey-hostbound@openssh.com";
+        // (earlier EXT_INFO, version, enabled in the config, bound)
+        let cases: [(bool, &[u8], bool, bool); 4] = [
+            (false, b"0", true, true),
+            (false, b"1", true, false),
+            (true, b"0", true, false),
+            (false, b"0", false, false),
+        ];
+        for (earlier, version, enabled, bound) in cases {
+            let (mut session, _sender, _reply) = keyboard_interactive_session();
+            session.common.config = Arc::new(Config {
+                publickey_host_bound: enabled,
+                ..Config::default()
+            });
+            session.initial_host_key_blob = Some(b"host key".to_vec());
+            if earlier {
+                session
+                    .process_packet(&mut TestHandler, &ext_info_packet("x", b""))
+                    .await
+                    .unwrap();
+            }
+            session
+                .process_packet(&mut TestHandler, &ext_info_packet(HOSTBOUND, version))
+                .await
+                .unwrap();
+            assert_eq!(
+                session.host_bound_key.as_deref(),
+                bound.then_some(&b"host key"[..]),
+                "earlier {earlier}, version {version:?}, enabled {enabled}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2795,6 +2848,12 @@ pub struct Config {
     pub gex: GexParams,
     /// If active, invoke `set_nodelay(true)` on the ssh socket; disabled by default (i.e. Nagle's algorithm is active).
     pub nodelay: bool,
+    /// Sign public key authentication requests with
+    /// `publickey-hostbound-v00@openssh.com` when the server offers it,
+    /// which binds the signature to the server's host key, as OpenSSH does.
+    /// OpenSSH agents only sign with keys restricted to certain hosts
+    /// (`ssh-add -h`) for such requests. Enabled by default.
+    pub publickey_host_bound: bool,
 }
 
 impl Default for Config {
@@ -2817,6 +2876,7 @@ impl Default for Config {
             anonymous: false,
             gex: Default::default(),
             nodelay: false,
+            publickey_host_bound: true,
         }
     }
 }

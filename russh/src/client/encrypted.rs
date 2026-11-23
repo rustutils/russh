@@ -256,6 +256,7 @@ impl Session {
                                     enc.client_send_signature(
                                         &self.common.auth_user,
                                         &auth_method,
+                                        self.host_bound_key.as_deref(),
                                         &mut self.common.buffer,
                                     )?
                                 }
@@ -264,6 +265,7 @@ impl Session {
                                     enc.client_send_signature(
                                         &self.common.auth_user,
                                         &auth_method,
+                                        self.host_bound_key.as_deref(),
                                         &mut self.common.buffer,
                                     )?
                                 }
@@ -277,6 +279,7 @@ impl Session {
                                             hash_alg,
                                         },
                                         None,
+                                        self.host_bound_key.as_deref(),
                                         &mut self.common.buffer,
                                     )?;
                                     let len = self.common.buffer.len();
@@ -320,6 +323,7 @@ impl Session {
                                         &self.common.auth_user,
                                         &PublicKeyOrCertificate::Certificate(cert.clone()),
                                         hash_alg,
+                                        self.host_bound_key.as_deref(),
                                         &mut self.common.buffer,
                                     )?;
                                     let len = self.common.buffer.len();
@@ -444,6 +448,17 @@ impl Session {
             let name = String::decode(r)?;
             if name == "server-sig-algs" {
                 self.handle_server_sig_algs_ext(r)?;
+            } else if name == "publickey-hostbound@openssh.com" {
+                let version = Vec::<u8>::decode(r)?;
+                debug!("* {name:?} version {:?}", String::from_utf8_lossy(&version));
+                // Like OpenSSH, only the initial EXT_INFO counts, and only
+                // the version it implements.
+                if self.ext_info_count == 1
+                    && version == b"0"
+                    && self.common.config.publickey_host_bound
+                {
+                    self.host_bound_key = self.initial_host_key_blob.clone();
+                }
             } else {
                 let data = Vec::<u8>::decode(r)?;
                 debug!("* {name:?} (unknown, data: {data:?})");
@@ -1363,6 +1378,7 @@ mod tests {
                     "alice",
                     &PublicKeyOrCertificate::Certificate(certificate.clone()),
                     hash_alg,
+                    None,
                     &mut signed,
                 )
                 .unwrap();
@@ -1375,6 +1391,49 @@ mod tests {
                 decode_userauth_certificate_algorithm(signed_request, true),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn host_bound_requests_name_the_method_and_end_with_the_host_key() {
+        let key = crate::keys::PrivateKey::random(
+            &mut rand::rng(),
+            crate::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let blob = key.public_key().to_bytes().unwrap();
+        for (host_key, method) in [
+            (None, "publickey"),
+            (Some(&b"host key"[..]), "publickey-hostbound-v00@openssh.com"),
+        ] {
+            let mut encrypted = test_encrypted();
+            let mut signed = Vec::new();
+            let i0 = encrypted
+                .client_make_to_sign(
+                    "alice",
+                    &PublicKeyOrCertificate::PublicKey {
+                        key: key.public_key().clone(),
+                        hash_alg: None,
+                    },
+                    None,
+                    host_key,
+                    &mut signed,
+                )
+                .unwrap();
+            let mut request = &signed[..];
+            assert_eq!(Vec::<u8>::decode(&mut request).unwrap(), b"session-id");
+            assert_eq!(signed.len() - request.len(), i0);
+            assert_eq!(u8::decode(&mut request).unwrap(), msg::USERAUTH_REQUEST);
+            assert_eq!(String::decode(&mut request).unwrap(), "alice");
+            assert_eq!(String::decode(&mut request).unwrap(), "ssh-connection");
+            assert_eq!(String::decode(&mut request).unwrap(), method);
+            assert_eq!(u8::decode(&mut request).unwrap(), 1);
+            assert_eq!(String::decode(&mut request).unwrap(), "ssh-ed25519");
+            assert_eq!(Vec::<u8>::decode(&mut request).unwrap(), blob);
+            if let Some(host_key) = host_key {
+                assert_eq!(Vec::<u8>::decode(&mut request).unwrap(), host_key);
+            }
+            ensure_end(&request).unwrap();
         }
     }
 }
@@ -1528,11 +1587,15 @@ impl Encrypted {
         Ok(())
     }
 
+    /// The signed part of a public key request, after the session id. With
+    /// `host_bound_key`, the request uses
+    /// `publickey-hostbound-v00@openssh.com` and ends with that host key.
     fn client_make_to_sign(
         &mut self,
         user: &str,
         key: &PublicKeyOrCertificate,
         certificate_hash_alg: Option<ssh_key::HashAlg>,
+        host_bound_key: Option<&[u8]>,
         buffer: &mut Vec<u8>,
     ) -> Result<usize, crate::Error> {
         buffer.clear();
@@ -1542,7 +1605,11 @@ impl Encrypted {
         buffer.push(msg::USERAUTH_REQUEST);
         user.encode(buffer)?;
         "ssh-connection".encode(buffer)?;
-        "publickey".encode(buffer)?;
+        if host_bound_key.is_some() {
+            "publickey-hostbound-v00@openssh.com".encode(buffer)?;
+        } else {
+            "publickey".encode(buffer)?;
+        }
         1u8.encode(buffer)?;
 
         match key {
@@ -1558,6 +1625,9 @@ impl Encrypted {
                 key.to_bytes()?.encode(buffer)?;
             }
         }
+        if let Some(host_key) = host_bound_key {
+            host_key.encode(buffer)?;
+        }
         Ok(i0)
     }
 
@@ -1565,6 +1635,7 @@ impl Encrypted {
         &mut self,
         user: &str,
         method: &auth::Method,
+        host_bound_key: Option<&[u8]>,
         buffer: &mut Vec<u8>,
     ) -> Result<(), crate::Error> {
         match method {
@@ -1573,6 +1644,7 @@ impl Encrypted {
                     user,
                     &PublicKeyOrCertificate::from(key),
                     None,
+                    host_bound_key,
                     buffer,
                 )?;
 
@@ -1589,6 +1661,7 @@ impl Encrypted {
                     user,
                     &PublicKeyOrCertificate::Certificate(cert.clone()),
                     None,
+                    host_bound_key,
                     buffer,
                 )?;
 
